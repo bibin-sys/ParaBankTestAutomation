@@ -1,0 +1,1 @@
+[{"uid":"a120df316e70bf28","name":"test_transfer_funds","time":{"start":1730644480553,"stop":1730644485697,"duration":5144},"status":"failed","severity":"normal"},{"uid":"6e697c100cceca4c","name":"test_login_to_parabank","time":{"start":1730644475262,"stop":1730644480496,"duration":5234},"status":"failed","severity":"normal"}]
