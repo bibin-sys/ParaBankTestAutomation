@@ -1,0 +1,53 @@
+stages:
+  - test
+  - report
+
+variables:
+  VIRTUAL_ENV: .venv
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip/
+
+before_script:
+  # Install Python and set up the environment
+  - python -m venv $VIRTUAL_ENV
+  - source $VIRTUAL_ENV/bin/activate
+  - pip install -r requirements.txt
+
+test_job:
+  stage: test
+  script:
+    # Run Pytest and generate Allure results
+    - pytest tests/ --alluredir=./allure-results
+  artifacts:
+    paths:
+      - allure-results
+    expire_in: 1 week
+
+generate_report:
+  stage: report
+  dependencies:
+    - test_job
+  script:
+    # Generate the Allure report
+    - allure generate ./allure-results -o ./allure-report --clean
+  artifacts:
+    paths:
+      - allure-report
+    expire_in: 1 week
+  when: on_success
+
+pages:
+  stage: report
+  dependencies:
+    - generate_report
+  script:
+    # Publish the Allure report as a GitLab Pages site
+    - mv ./allure-report public
+  artifacts:
+    paths:
+      - public
+  only:
+    - main  # Change to the default branch of your project
