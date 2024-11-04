@@ -1,0 +1,6 @@
+selenium==4.26.1
+pytest==8.3.3
+allure-pytest==2.13.5
+chromedriver-autoinstaller==0.6.4
+requests==2.31.0
+pytest-xdist==3.3.1
