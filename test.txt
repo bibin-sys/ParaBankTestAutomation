@@ -1,0 +1,39 @@
+Subject: Clarification needed: Instance Scheduler behavior with SSM Maintenance Windows (start/stop across multiple windows)
+
+Hi [TAM Name],
+
+I’m seeking confirmation on the intended behavior of Instance Scheduler on AWS when using SSM Maintenance Windows.
+
+Context (our test)
+
+Two SSM Maintenance Windows in the same account/Region:
+
+Patch Tuesday: 12:00–16:00
+
+Patch Thursday: 12:00–16:00
+
+Two EC2 instances, each targeted by a different window.
+
+Both instances are tagged with the same schedule name (e.g., Schedule=0).
+
+DynamoDB schedule config:
+
+use_maintenance_window: true
+
+ssm_maintenance_window: ["Patch-Tuesday-1200-1600","Patch-Thursday-1200-1600"]
+
+Observed behavior
+
+At Tuesday 12:01, both instances start, including the instance intended only for the Thursday window.
+
+At the close of the Tuesday window, both instances stop as well (i.e., start/stop actions are applied to all instances sharing the schedule name, not just those targeted by the Tuesday window).
+
+Expected behavior (our understanding of how it should work)
+
+Normally, Instance Scheduler should evaluate the SSM Maintenance Window and start/stop only the instances that are members of that window’s target set. In other words, when the Tuesday window is active, only the instance targeted by Tuesday should be started/stopped, and the Thursday-targeted instance should remain unaffected.
+
+Request for confirmation
+
+Please confirm whether Instance Scheduler, when use_maintenance_window is enabled, does not check the SSM Maintenance Window’s registered targets and instead applies start/stop actions to all instances that share the schedule name whenever any of the listed windows is active.
+
+If that is the intended design, we will adjust our rollout (e.g., one schedule per window or other segmentation) to avoid cross-start/stop behavior.
