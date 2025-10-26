@@ -1,403 +1,380 @@
 #!/usr/bin/env python3
-"""Merge multiple IAM policies into a single normalized policy document.
+"""
+merge_iam_policies.py — Fetch IAM policies by ARN and merge into one normalized policy.
 
-This script is the Python port of the earlier PowerShell utility.  It preserves
-feature parity including AWS-managed policy fetching, statement normalization,
-condition-aware coalescing, Sid uniqueness, and optional validation via
-``aws iam validate-policy``.
+Usage:
+  python merge_iam_policies.py --policy-arns arn1 arn2 ... --aws-profile myprofile --output-path merged-policy.json --validate
+
+Notes:
+- Needs boto3: pip install boto3
+- Creds/profile must allow iam:GetPolicy and iam:GetPolicyVersion
 """
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
-import sys
+import os
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Union
 from urllib.parse import unquote
 
+import boto3
 import shutil
+import subprocess
+import sys
+
+JSON = Union[dict, list, str, int, float, bool, None]
+PolicyDocument = Dict[str, JSON]
 
 
-JSONType = Optional[object]
-PolicyDocument = Dict[str, JSONType]
+# ---------------------------- CLI & helpers ----------------------------
+
+def _debug(msg: str) -> None:
+    print(msg)
 
 
-def _debug(message: str) -> None:
-    print(message)
-
-
-def _warn(message: str) -> None:
-    print(f"Warning: {message}", file=sys.stderr)
+def _warn(msg: str) -> None:
+    print(f"Warning: {msg}", file=sys.stderr)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    # Support the PowerShell-style parameter names for backward compatibility by
-    # translating them into the argparse-friendly forms before parsing.
+    # Accept PowerShell-style flags for convenience
     translated: List[str] = []
     mapping = {
         "-PolicyFiles": "--policy-files",
         "-PolicyArns": "--policy-arns",
         "-OutputPath": "--output-path",
         "-AwsProfile": "--aws-profile",
+        "-Validate": "--validate",
     }
-    for token in argv:
-        translated.append(mapping.get(token, token))
-    parser = argparse.ArgumentParser(description=__doc__)
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--policy-arns", nargs="+", help="Managed policy ARNs to download")
-    group.add_argument("--policy-files", nargs="+", help="Local policy document paths")
-    parser.add_argument(
-        "--output-path",
-        default="./merged-policy.json",
-        help="Destination file for the merged policy (default: ./merged-policy.json)",
-    )
-    parser.add_argument("--aws-profile", help="AWS CLI profile to use for iam:GetPolicy calls")
-    return parser.parse_args(translated)
+    for t in argv:
+        translated.append(mapping.get(t, t))
+
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--policy-arns", nargs="+", help="Managed policy ARNs to download")
+    g.add_argument("--policy-files", nargs="+", help="Local policy document JSON files")
+    p.add_argument("--aws-profile", help="AWS profile for boto3 Session")
+    p.add_argument("--output-path", default="./merged-policy.json", help="Destination for merged policy")
+    p.add_argument("--validate", action="store_true", help="Run `aws iam validate-policy` on the output")
+    return p.parse_args(translated)
 
 
-def run_aws_cli_json(args: Sequence[str], profile: Optional[str]) -> PolicyDocument:
-    full_args = ["aws", *args]
-    if profile:
-        full_args[1:1] = ["--profile", profile]
-    _debug(f"Running: {' '.join(full_args)}")
-    completed = subprocess.run(full_args, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "AWS CLI command failed ({}): {}\n{}".format(
-                completed.returncode, " ".join(full_args), completed.stderr or completed.stdout
-            )
-        )
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"Unable to parse AWS CLI response as JSON for command {' '.join(full_args)}"
-        ) from exc
+# ---------------------------- Policy parsing ----------------------------
 
+def parse_policy_document(raw: Union[str, dict]) -> PolicyDocument:
+    """
+    Accepts a dict (already parsed) or a string that may be JSON or URL-encoded JSON.
+    Returns a dict.
+    """
+    if isinstance(raw, dict):
+        return raw
 
-def parse_policy_document(raw: str) -> PolicyDocument:
-    raw = raw.strip()
-    if not raw:
+    if not isinstance(raw, str):
+        raise ValueError("Policy document must be dict or JSON string")
+
+    txt = raw.strip()
+    if not txt:
         raise ValueError("Policy document is empty")
+
+    # Try direct JSON
     try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
+        doc = json.loads(txt)
+        if not isinstance(doc, dict):
             raise ValueError("Policy document must be a JSON object")
-        return data
+        return doc
     except json.JSONDecodeError:
         pass
-    decoded = unquote(raw)
-    try:
-        data = json.loads(decoded)
-        if not isinstance(data, dict):
-            raise ValueError("Policy document must be a JSON object")
-        return data
-    except json.JSONDecodeError as exc:
-        raise ValueError("Failed to parse policy document JSON") from exc
+
+    # Try URL-decoded JSON
+    decoded = unquote(txt)
+    doc = json.loads(decoded)
+    if not isinstance(doc, dict):
+        raise ValueError("Policy document must be a JSON object")
+    return doc
 
 
-def convert_to_normalized_array(value: JSONType) -> List[str]:
-    if value is None:
+def load_documents_from_files(paths: Sequence[str]) -> List[PolicyDocument]:
+    docs: List[PolicyDocument] = []
+    for fp in paths:
+        path = Path(fp)
+        if not path.exists():
+            raise FileNotFoundError(f"Policy file not found: {fp}")
+        _debug(f"Loading policy document from {path}")
+        docs.append(parse_policy_document(path.read_text(encoding="utf-8")))
+    return docs
+
+
+def load_documents_from_arns(arns: Sequence[str], profile: Optional[str]) -> List[PolicyDocument]:
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    iam = session.client("iam")
+
+    docs: List[PolicyDocument] = []
+    for arn in arns:
+        _debug(f"Fetching policy document for {arn}")
+        policy = iam.get_policy(PolicyArn=arn)
+        version_id = policy["Policy"]["DefaultVersionId"]
+        version = iam.get_policy_version(PolicyArn=arn, VersionId=version_id)
+        doc_raw = version["PolicyVersion"]["Document"]
+        docs.append(parse_policy_document(doc_raw))
+    return docs
+
+
+# ---------------------------- Normalization & merge ----------------------------
+
+def _to_list(v: JSON) -> List[str]:
+    if v is None:
         return []
-    items: List[str] = []
-    if isinstance(value, (list, tuple, set)):
-        for entry in value:
-            if entry not in (None, ""):
-                items.append(str(entry))
-    else:
-        if value not in (None, ""):
-            items.append(str(value))
-    return items
+    if isinstance(v, (list, tuple, set)):
+        return [str(x) for x in v if x not in (None, "")]
+    return [str(v)] if v not in (None, "") else []
 
 
-def canonicalize_structure(value: JSONType) -> JSONType:
+def _canonicalize(value: JSON) -> JSON:
+    """Recursively order dict keys and deterministically order arrays by their JSON form."""
     if value is None:
         return None
     if isinstance(value, dict):
         ordered = OrderedDict()
-        for key in sorted(value):
-            ordered[key] = canonicalize_structure(value[key])
+        for k in sorted(value.keys()):
+            ordered[k] = _canonicalize(value[k])
         return ordered
     if isinstance(value, list):
-        canonical_items = [canonicalize_structure(item) for item in value]
-        if len(canonical_items) <= 1:
-            return canonical_items
+        items = [_canonicalize(x) for x in value]
+        if len(items) <= 1:
+            return items
         keyed = sorted(
-            ((json.dumps(item, separators=(",", ":"), ensure_ascii=False), item) for item in canonical_items),
-            key=lambda pair: pair[0],
+            ((json.dumps(i, separators=(",", ":"), ensure_ascii=False), i) for i in items),
+            key=lambda p: p[0]
         )
-        return [item for _, item in keyed]
+        return [i for _, i in keyed]
     return value
 
 
-def canonical_json(value: JSONType) -> str:
+def _canonical_json(value: JSON) -> str:
     if value is None:
         return ""
-    canonical = canonicalize_structure(value)
-    return json.dumps(canonical, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(_canonicalize(value), separators=(",", ":"), ensure_ascii=False)
 
 
 @dataclass
-class CaseInsensitiveOrderedSet:
+class CISet:
+    """Case-insensitive ordered set preserving original casing of first occurrence."""
     _data: Dict[str, str] = field(default_factory=dict)
-
-    def add_all(self, values: Iterable[str]) -> None:
-        for value in values:
-            lower = value.lower()
-            if lower not in self._data:
-                self._data[lower] = value
-
-    def to_sorted_list(self) -> List[str]:
+    def add_all(self, vals: Iterable[str]) -> None:
+        for v in vals:
+            key = v.lower()
+            if key not in self._data:
+                self._data[key] = v
+    def to_sorted(self) -> List[str]:
         return sorted(self._data.values())
-
-    def __len__(self) -> int:  # pragma: no cover - trivial
+    def __len__(self) -> int:
         return len(self._data)
 
 
 @dataclass
-class StatementGroup:
+class Group:
     effect: str
     action_side: str
     resource_side: str
-    condition: JSONType
+    condition: JSON
     condition_key: str
     resource_key: str
     sid_candidates: List[str] = field(default_factory=list)
-    action_values: CaseInsensitiveOrderedSet = field(default_factory=CaseInsensitiveOrderedSet)
-    resource_values: CaseInsensitiveOrderedSet = field(default_factory=CaseInsensitiveOrderedSet)
+    action_vals: CISet = field(default_factory=CISet)
+    resource_vals: CISet = field(default_factory=CISet)
 
 
-def normalize_statement(statement: PolicyDocument) -> PolicyDocument:
-    normalized = deepcopy(statement)
-    for key in ("Action", "NotAction", "Resource", "NotResource"):
-        if key in normalized:
-            normalized[key] = convert_to_normalized_array(normalized[key])
-    return normalized
+def _normalize_statement(st: PolicyDocument) -> PolicyDocument:
+    stn = deepcopy(st)
+    for k in ("Action", "NotAction", "Resource", "NotResource"):
+        if k in stn:
+            stn[k] = _to_list(stn[k])
+    return stn
 
 
-def new_statement_group(
-    statement: PolicyDocument,
-    action_side: str,
-    resource_side: str,
-    condition_key: str,
-    original_condition: JSONType,
-    resource_key: str,
-) -> StatementGroup:
-    group = StatementGroup(
-        effect=str(statement["Effect"]),
+def _new_group(st: PolicyDocument, action_side: str, resource_side: str,
+               cond_key: str, cond_obj: JSON, res_key: str) -> Group:
+    g = Group(
+        effect=str(st["Effect"]),
         action_side=action_side,
         resource_side=resource_side,
-        condition=original_condition,
-        condition_key=condition_key,
-        resource_key=resource_key,
+        condition=cond_obj,
+        condition_key=cond_key,
+        resource_key=res_key
     )
     if action_side:
-        group.action_values.add_all(statement[action_side])
+        g.action_vals.add_all(st[action_side])
     if resource_side:
-        group.resource_values.add_all(statement[resource_side])
-    sid = statement.get("Sid")
+        g.resource_vals.add_all(st[resource_side])
+    sid = st.get("Sid")
     if isinstance(sid, str) and sid.strip():
-        group.sid_candidates.append(sid)
-    return group
+        g.sid_candidates.append(sid)
+    return g
 
 
-def merge_into_group(group: StatementGroup, statement: PolicyDocument, action_side: str, resource_side: str) -> None:
+def _merge_into(g: Group, st: PolicyDocument, action_side: str, resource_side: str) -> None:
     if action_side:
-        group.action_values.add_all(statement[action_side])
+        g.action_vals.add_all(st[action_side])
     if resource_side:
-        group.resource_values.add_all(statement[resource_side])
-    sid = statement.get("Sid")
+        g.resource_vals.add_all(st[resource_side])
+    sid = st.get("Sid")
     if isinstance(sid, str) and sid.strip():
-        group.sid_candidates.append(sid)
+        g.sid_candidates.append(sid)
 
 
-def assign_unique_sid(preferred: Optional[str], sid_usage: Dict[str, int], auto_counter: List[int]) -> str:
-    base = preferred if preferred and preferred.strip() else f"AutoSid_{auto_counter[0]}"
+def _assign_unique_sid(preferred: Optional[str], usage: Dict[str, int], counter: List[int]) -> str:
+    base = preferred.strip() if (preferred and preferred.strip()) else f"AutoSid_{counter[0]}"
     if not preferred or not preferred.strip():
-        auto_counter[0] += 1
-    if base not in sid_usage:
-        sid_usage[base] = 1
+        counter[0] += 1
+    if base not in usage:
+        usage[base] = 1
         return base
-    index = sid_usage[base]
-    candidate = f"{base}_{index}"
-    while candidate in sid_usage:
-        index += 1
-        candidate = f"{base}_{index}"
-    sid_usage[base] = index + 1
-    sid_usage[candidate] = 1
-    return candidate
+    idx = usage[base]
+    cand = f"{base}_{idx}"
+    while cand in usage:
+        idx += 1
+        cand = f"{base}_{idx}"
+    usage[base] = idx + 1
+    usage[cand] = 1
+    return cand
 
 
-def load_documents_from_files(paths: Sequence[str]) -> List[PolicyDocument]:
-    documents: List[PolicyDocument] = []
-    for file_path in paths:
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Policy file not found: {file_path}")
-        _debug(f"Loading policy document from {path}")
-        raw = path.read_text()
-        documents.append(parse_policy_document(raw))
-    return documents
-
-
-def load_documents_from_arns(arns: Sequence[str], profile: Optional[str]) -> List[PolicyDocument]:
-    documents: List[PolicyDocument] = []
-    for arn in arns:
-        _debug(f"Fetching policy document for {arn}")
-        policy = run_aws_cli_json(["iam", "get-policy", "--policy-arn", arn], profile)
-        default_version = policy["Policy"]["DefaultVersionId"]
-        version = run_aws_cli_json(
-            ["iam", "get-policy-version", "--policy-arn", arn, "--version-id", default_version], profile
-        )
-        document = version["PolicyVersion"]["Document"]
-        if not isinstance(document, str):
-            raise ValueError("Expected policy document to be a string")
-        documents.append(parse_policy_document(document))
-    return documents
-
-
-def iterate_statements(document: PolicyDocument) -> Iterable[PolicyDocument]:
-    if not document or "Statement" not in document:
+def iterate_statements(doc: PolicyDocument) -> Iterable[PolicyDocument]:
+    if not doc or "Statement" not in doc:
         return []
-    statement = document["Statement"]
-    if isinstance(statement, list):
-        return [item for item in statement if item]
-    if statement:
-        return [statement]
-    return []
+    st = doc["Statement"]
+    if isinstance(st, list):
+        return [x for x in st if x]
+    return [st] if st else []
 
 
-def merge_policies(documents: Sequence[PolicyDocument]) -> List[PolicyDocument]:
-    groups: "OrderedDict[str, StatementGroup]" = OrderedDict()
-    for document in documents:
-        for statement in iterate_statements(document):
-            if not isinstance(statement, dict):
+def merge_policies(docs: Sequence[PolicyDocument]) -> List[PolicyDocument]:
+    groups: "OrderedDict[str, Group]" = OrderedDict()
+    for doc in docs:
+        for st in iterate_statements(doc):
+            if not isinstance(st, dict):
                 continue
-            if "Principal" in statement:
-                sid = statement.get("Sid", "[no Sid]")
-                _warn(f"Skipping trust policy statement (contains Principal): {sid}")
+            if "Principal" in st:
+                _warn(f"Skipping trust policy statement (contains Principal): {st.get('Sid','[no Sid]')}")
                 continue
-            if "Effect" not in statement:
-                sid = statement.get("Sid", "[no Sid]")
-                _warn(f"Skipping statement without Effect: {sid}")
+            if "Effect" not in st:
+                _warn(f"Skipping statement without Effect: {st.get('Sid','[no Sid]')}")
                 continue
-            has_action = "Action" in statement
-            has_not_action = "NotAction" in statement
+            has_action = "Action" in st
+            has_not_action = "NotAction" in st
             if has_action and has_not_action:
-                sid = statement.get("Sid", "[no Sid]")
-                _warn(f"Skipping statement with both Action and NotAction: {sid}")
+                _warn(f"Skipping statement with both Action and NotAction: {st.get('Sid','[no Sid]')}")
                 continue
             if not has_action and not has_not_action:
                 _warn("Skipping statement without Action or NotAction.")
                 continue
-            has_resource = "Resource" in statement
-            has_not_resource = "NotResource" in statement
-            if has_resource and has_not_resource:
+            has_res = "Resource" in st
+            has_not_res = "NotResource" in st
+            if has_res and has_not_res:
                 _warn("Skipping statement with both Resource and NotResource.")
                 continue
-            original_condition = deepcopy(statement.get("Condition")) if "Condition" in statement else None
-            normalized = normalize_statement(statement)
-            action_side = "NotAction" if "NotAction" in normalized else ("Action" if "Action" in normalized else "")
-            resource_side = (
-                "NotResource"
-                if "NotResource" in normalized
-                else ("Resource" if "Resource" in normalized else "")
-            )
+
+            cond_orig = deepcopy(st.get("Condition")) if "Condition" in st else None
+            norm = _normalize_statement(st)
+            action_side = "NotAction" if "NotAction" in norm else ("Action" if "Action" in norm else "")
+            resource_side = "NotResource" if "NotResource" in norm else ("Resource" if "Resource" in norm else "")
             if not resource_side:
                 resource_side = "Resource"
-                normalized[resource_side] = ["*"]
-            condition_key = canonical_json(original_condition) if original_condition is not None else ""
-            resource_key = canonical_json(normalized.get(resource_side)) if resource_side else ""
-            group_key = "|".join([str(normalized["Effect"]), action_side, resource_side, condition_key, resource_key])
-            if group_key not in groups:
-                groups[group_key] = new_statement_group(
-                    normalized,
-                    action_side,
-                    resource_side,
-                    condition_key,
-                    original_condition,
-                    resource_key,
-                )
-            else:
-                merge_into_group(groups[group_key], normalized, action_side, resource_side)
-    sid_usage: Dict[str, int] = {}
-    auto_counter = [1]
-    final_statements: List[PolicyDocument] = []
-    for group in groups.values():
-        if group.sid_candidates:
-            preferred = sorted(group.sid_candidates)[0]
-        else:
-            preferred = None
-        final_sid = assign_unique_sid(preferred, sid_usage, auto_counter)
-        statement: "OrderedDict[str, JSONType]" = OrderedDict()
-        statement["Sid"] = final_sid
-        statement["Effect"] = group.effect
-        if group.action_side == "Action":
-            actions = group.action_values.to_sorted_list()
-            if actions:
-                statement["Action"] = actions
-        elif group.action_side == "NotAction":
-            not_actions = group.action_values.to_sorted_list()
-            if not_actions:
-                statement["NotAction"] = not_actions
-        if group.resource_side == "Resource":
-            resources = group.resource_values.to_sorted_list()
-            if resources:
-                statement["Resource"] = resources
-        elif group.resource_side == "NotResource":
-            not_resources = group.resource_values.to_sorted_list()
-            if not_resources:
-                statement["NotResource"] = not_resources
-        if group.condition is not None:
-            statement["Condition"] = group.condition
-        has_actions = group.action_side == "Action" and len(group.action_values) > 0
-        has_not_actions = group.action_side == "NotAction" and len(group.action_values) > 0
-        if not (has_actions or has_not_actions):
-            continue
-        final_statements.append(statement)
-    return final_statements
+                norm[resource_side] = ["*"]
 
+            cond_key = _canonical_json(cond_orig) if cond_orig is not None else ""
+            res_key = _canonical_json(norm.get(resource_side)) if resource_side else ""
+            gkey = "|".join([str(norm["Effect"]), action_side, resource_side, cond_key, res_key])
+
+            if gkey not in groups:
+                groups[gkey] = _new_group(norm, action_side, resource_side, cond_key, cond_orig, res_key)
+            else:
+                _merge_into(groups[gkey], norm, action_side, resource_side)
+
+    usage: Dict[str, int] = {}
+    counter = [1]
+    final_stmts: List[PolicyDocument] = []
+    for g in groups.values():
+        preferred = sorted(g.sid_candidates)[0] if g.sid_candidates else None
+        sid = _assign_unique_sid(preferred, usage, counter)
+        stmt: "OrderedDict[str, JSON]" = OrderedDict()
+        stmt["Sid"] = sid
+        stmt["Effect"] = g.effect
+
+        if g.action_side == "Action":
+            acts = g.action_vals.to_sorted()
+            if acts: stmt["Action"] = acts
+        elif g.action_side == "NotAction":
+            nacts = g.action_vals.to_sorted()
+            if nacts: stmt["NotAction"] = nacts
+
+        if g.resource_side == "Resource":
+            res = g.resource_vals.to_sorted()
+            if res: stmt["Resource"] = res
+        elif g.resource_side == "NotResource":
+            nres = g.resource_vals.to_sorted()
+            if nres: stmt["NotResource"] = nres
+
+        if g.condition is not None:
+            stmt["Condition"] = g.condition
+
+        has_acts = (g.action_side == "Action" and len(g.action_vals) > 0)
+        has_nacts = (g.action_side == "NotAction" and len(g.action_vals) > 0)
+        if not (has_acts or has_nacts):
+            continue
+
+        final_stmts.append(stmt)
+
+    return final_stmts
+
+
+# ---------------------------- Output & validation ----------------------------
 
 def write_output(statements: Sequence[PolicyDocument], output_path: str) -> Path:
-    merged_policy = OrderedDict()
-    merged_policy["Version"] = "2012-10-17"
-    merged_policy["Statement"] = list(statements)
-    merged_json = json.dumps(merged_policy, indent=4)
-    byte_count = len(merged_json.encode("utf-8"))
+    policy = OrderedDict()
+    policy["Version"] = "2012-10-17"
+    policy["Statement"] = list(statements)
+
+    merged = json.dumps(policy, indent=4, ensure_ascii=False)
+    bytes_len = len(merged.encode("utf-8"))
+
     path = Path(output_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(merged_json, encoding="utf-8")
+    path.write_text(merged, encoding="utf-8")
+
     _debug(f"Merged policy written to {path}")
-    if byte_count >= 6000:
-        _warn(f"Merged policy size {byte_count}B is close to the AWS managed policy limit (6144 bytes).")
-    try:
-        json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Merged policy is not valid JSON") from exc
-    _debug(f"Statements: {len(statements)}; Size: {byte_count}B")
+    _debug(f"Statements: {len(statements)}; Size: {bytes_len}B")
+
+    if bytes_len >= 6000:
+        _warn("Merged policy size is close to AWS managed policy limit (6144 bytes).")
+
+    # sanity re-parse
+    json.loads(path.read_text(encoding="utf-8"))
     return path
 
 
 def validate_with_aws(path: Path, profile: Optional[str]) -> None:
     if not shutil.which("aws"):
-        _debug("AWS CLI not available for validate-policy check.")
+        _debug("AWS CLI not found; skipping validate-policy.")
         return
     args = ["aws"]
     if profile:
-        args.extend(["--profile", profile])
-    args.extend(["iam", "validate-policy", "--policy-document", f"file://{path}"])
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.stdout.strip():
-        _debug(f"aws iam validate-policy output:\n{result.stdout.strip()}")
-    if result.stderr.strip():
-        _warn(f"aws iam validate-policy errors:\n{result.stderr.strip()}")
-    if result.returncode != 0:
-        _warn("aws iam validate-policy reported an issue or could not be executed successfully.")
+        args += ["--profile", profile]
+    args += ["iam", "validate-policy", "--policy-document", f"file://{path}"]
+    res = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+    if res.stdout.strip():
+        _debug("aws iam validate-policy output:\n" + res.stdout.strip())
+    if res.stderr.strip():
+        _warn("aws iam validate-policy errors:\n" + res.stderr.strip())
+    if res.returncode != 0:
+        _warn("validate-policy reported issues.")
 
+
+# ---------------------------- Main ----------------------------
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
@@ -406,14 +383,18 @@ def main(argv: Sequence[str]) -> int:
             documents = load_documents_from_files(args.policy_files)
         else:
             documents = load_documents_from_arns(args.policy_arns, args.aws_profile)
+
         statements = merge_policies(documents)
-        output_path = write_output(statements, args.output_path)
-        validate_with_aws(output_path, args.aws_profile)
-    except Exception as exc:  # pragma: no cover - exercised indirectly
+        out = write_output(statements, args.output_path)
+
+        if args.validate:
+            validate_with_aws(out, args.aws_profile)
+
+    except Exception as exc:
         _warn(str(exc))
         return 1
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
+if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
