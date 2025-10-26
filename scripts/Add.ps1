@@ -5,28 +5,34 @@ function Invoke-AwsCliJson {
         [string]   $Profile
     )
 
-    # Force JSON and disable pager so output is clean.
     $fullArgs = @('--output','json','--no-cli-pager')
     if ($Profile) { $fullArgs += @('--profile', $Profile) }
     $fullArgs += $Arguments
+    $argLine = ($fullArgs -join ' ')
 
-    # Capture only stdout on success; don't contaminate JSON with stderr.
-    $stdout = & aws @fullArgs 2>$null
-    $exit   = $LASTEXITCODE
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'aws'
+    $psi.Arguments = $argLine
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
 
-    if ($exit -ne 0) {
-        # Get stderr for a helpful error message
-        $stderr = & aws @fullArgs 1>$null 2>&1
-        throw "AWS CLI command failed ($exit): aws $($fullArgs -join ' ')`n$stderr"
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+
+    if ($p.ExitCode -ne 0) {
+        throw "AWS CLI command failed ($($p.ExitCode)): aws $argLine`n$stderr"
     }
 
-    # PS 5.1 returns string[]; join into one JSON string.
-    $jsonText = ($stdout -join "`n")
-
+    $jsonText = $stdout.Trim() -replace '^\uFEFF',''    # strip a BOM just in case
     try {
         return $jsonText | ConvertFrom-Json -Depth 100
-    }
-    catch {
-        throw "Unable to parse AWS CLI response as JSON: aws $($fullArgs -join ' ')`n$jsonText"
+    } catch {
+        throw "Unable to parse AWS CLI response as JSON: aws $argLine`n$jsonText"
     }
 }
