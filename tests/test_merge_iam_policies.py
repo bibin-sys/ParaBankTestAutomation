@@ -16,7 +16,7 @@ def ensure_pwsh_available():
         raise unittest.SkipTest("PowerShell (pwsh) is required for these tests") from exc
 
 
-def run_merge(policy_documents, *, expect_success=True, extra_args=None):
+def run_merge(policy_documents, *, expect_success=True, extra_args=None, aws_profile=None):
     ensure_pwsh_available()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -38,6 +38,8 @@ def run_merge(policy_documents, *, expect_success=True, extra_args=None):
         command = (
             f"& {ps_quote(str(SCRIPT_PATH))} -PolicyFiles {policy_literal} -OutputPath {ps_quote(str(output_path))}"
         )
+        if aws_profile:
+            command += f" -AwsProfile {ps_quote(aws_profile)}"
         cmd = ["pwsh", "-NoProfile", "-Command", command]
         if extra_args:
             cmd.extend(extra_args)
@@ -301,6 +303,11 @@ class MergeIamPoliciesTest(unittest.TestCase):
         doc1 = {"Statement": {"Sid": "Valid", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::bucket/*"}}
         merged, stdout, stderr = run_merge([doc1])
         self.assertIn("Statements: 1", stdout)
+
+    def test_accepts_aws_profile_parameter(self):
+        doc = {"Statement": {"Sid": "Profile", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}}
+        merged, stdout, stderr = run_merge([doc], aws_profile="example")
+        self.assertEqual(1, len(merged["Statement"]))
 
 
 if __name__ == "__main__":

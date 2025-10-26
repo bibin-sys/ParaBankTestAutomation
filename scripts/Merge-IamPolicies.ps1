@@ -7,7 +7,10 @@ param(
     [string[]]$PolicyFiles,
 
     [Parameter()]
-    [string]$OutputPath = './merged-policy.json'
+    [string]$OutputPath = './merged-policy.json',
+
+    [Parameter()]
+    [string]$AwsProfile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,12 +18,21 @@ $ErrorActionPreference = 'Stop'
 function Invoke-AwsCliJson {
     param(
         [Parameter(Mandatory=$true)]
-        [string[]]$Arguments
+        [string[]]$Arguments,
+
+        [string]$Profile
     )
 
-    $commandLine = "aws $($Arguments -join ' ')"
+    $fullArgs = @()
+    if ($Profile) {
+        $fullArgs += '--profile'
+        $fullArgs += $Profile
+    }
+    $fullArgs += $Arguments
+
+    $commandLine = "aws $($fullArgs -join ' ')"
     Write-Verbose "Running: $commandLine"
-    $result = & aws @Arguments 2>&1
+    $result = & aws @fullArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "AWS CLI command failed ($LASTEXITCODE): $commandLine`n$result"
     }
@@ -266,9 +278,9 @@ try {
         'Arns' {
             foreach ($arn in $PolicyArns) {
                 Write-Host "Fetching policy document for $arn"
-                $policy = Invoke-AwsCliJson -Arguments @('iam','get-policy','--policy-arn',$arn)
+                $policy = Invoke-AwsCliJson -Arguments @('iam','get-policy','--policy-arn',$arn) -Profile $AwsProfile
                 $defaultVersionId = $policy.Policy.DefaultVersionId
-                $version = Invoke-AwsCliJson -Arguments @('iam','get-policy-version','--policy-arn',$arn,'--version-id',$defaultVersionId)
+                $version = Invoke-AwsCliJson -Arguments @('iam','get-policy-version','--policy-arn',$arn,'--version-id',$defaultVersionId) -Profile $AwsProfile
                 $documents += ConvertFrom-PolicyDocumentString -Document $version.PolicyVersion.Document
             }
         }
@@ -469,7 +481,13 @@ try {
             Write-Host "Validating merged policy with aws iam validate-policy"
             $stdoutFile = [System.IO.Path]::GetTempFileName()
             $stderrFile = [System.IO.Path]::GetTempFileName()
-            & aws iam validate-policy --policy-document "file://$fullPath" 1> $stdoutFile 2> $stderrFile
+            $validateArgs = @()
+            if ($AwsProfile) {
+                $validateArgs += '--profile'
+                $validateArgs += $AwsProfile
+            }
+            $validateArgs += @('iam','validate-policy','--policy-document',"file://$fullPath")
+            & aws @validateArgs 1> $stdoutFile 2> $stderrFile
 
             if (Test-Path -LiteralPath $stdoutFile) {
                 $stdoutContent = Get-Content -LiteralPath $stdoutFile -Raw
